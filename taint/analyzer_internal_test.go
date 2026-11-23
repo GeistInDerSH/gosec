@@ -1613,3 +1613,99 @@ func TestSinkIDMatchesIssueText(t *testing.T) {
 		}
 	}
 }
+
+func TestReturnedTaintedStructureFieldAccessMayBeTainted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		handler     string
+		field       string
+		resultCount int
+	}{
+		{
+			name:        "access to tainted field reports tainted",
+			resultCount: 1,
+			field:       "comp.vuln",
+		},
+		{
+			name:        "access to untainted field reports untainted",
+			resultCount: 0,
+			field:       "comp.safe",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			httpPkg := makeHTTPPkg()
+			src := `package p
+
+import "net/http"
+
+func sink(s string) {}
+
+func source(r *http.Request) string { return "tainted" }
+
+type composite struct {
+	vuln string
+	safe string
+}
+
+func extract(r *http.Request) composite {
+	m := source(r)
+	return composite{vuln: m, safe: "untainted"}
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	comp := extract(r)
+	access := ` + test.field + `
+	sink(access)
+}
+`
+
+			fset := token.NewFileSet()
+			parsed, _ := parser.ParseFile(fset, "p.go", src, 0)
+			info := &types.Info{
+				Types: make(map[ast.Expr]types.TypeAndValue), Defs: make(map[*ast.Ident]types.Object),
+				Uses: make(map[*ast.Ident]types.Object), Implicits: make(map[ast.Node]types.Object),
+				Scopes: make(map[ast.Node]*types.Scope), Selections: make(map[*ast.SelectorExpr]*types.Selection),
+			}
+			pkg, err := (&types.Config{Importer: fakeImporterFunc(func(path string) (*types.Package, error) {
+				if path == "net/http" {
+					return httpPkg, nil
+				}
+				return nil, fmt.Errorf("unknown %q", path)
+			})}).Check("p", fset, []*ast.File{parsed}, info)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			prog := ssa.NewProgram(fset, 0)
+			prog.CreatePackage(httpPkg, nil, nil, false)
+			ssaPkg := prog.CreatePackage(pkg, []*ast.File{parsed}, info, true)
+			prog.Build()
+
+			fn := ssaPkg.Func("handler")
+			if fn == nil || len(fn.Params) < 2 {
+				t.Fatal("expected handler with 2 param")
+			}
+
+			analyzer := New(&Config{
+				Sources: []Source{{Package: "p", Name: "source", IsFunc: true}},
+				Sinks:   []Sink{{Package: "p", Method: "sink", CheckArgs: []int{0}}},
+			})
+			// Manually set up call graph + cache (same as Analyze does internally).
+			analyzer.callGraph = cha.CallGraph(prog)
+			analyzer.paramTaintCache = make(map[paramKey]bool)
+			analyzer.prog = prog
+
+			result := analyzer.analyzeFunctionSinks(fn)
+			if len(result) != test.resultCount {
+				t.Errorf("Expected %d sink(s) detected, but %d were found",
+					test.resultCount, len(result))
+			}
+		})
+	}
+}

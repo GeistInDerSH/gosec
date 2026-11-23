@@ -1166,6 +1166,16 @@ func (a *Analyzer) isFieldOfAllocTainted(alloc *ssa.Alloc, fieldIdx int, fn *ssa
 		return false
 	}
 	for _, ref := range *alloc.Referrers() {
+		// Whole-struct store: *alloc = val. Check if the specific field
+		// of val is tainted, preserving field sensitivity.
+		// e.g. *t0 = t1 where t1.msg is tainted but t1.timeout is not.
+		if store, ok := ref.(*ssa.Store); ok && store.Addr == alloc {
+			if a.isFieldTaintedOnValue(store.Val, fieldIdx, fn, visited, depth+1) {
+				return true
+			}
+			continue
+		}
+
 		fa, ok := ref.(*ssa.FieldAddr)
 		if !ok || fa.Field != fieldIdx {
 			continue
